@@ -6,6 +6,7 @@
 # - Keeps CLI usage simple for teammates and the instructor.
 #
 # Contributors:
-# - <Name 1>
-# - <Name 2>
-# - <Name 3>
+# - Anton Nemchinski
+
+
+python -m src.train --config config/default.yaml

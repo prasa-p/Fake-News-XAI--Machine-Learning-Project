@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 .env
-
+.envrc
 # data & artifacts
 data/*
 !data/.gitkeep
@@ -16,3 +16,6 @@ artifacts/*
 # hf caches
 .cache/
 huggingface/
+
+# Other
+requirements_local.txt

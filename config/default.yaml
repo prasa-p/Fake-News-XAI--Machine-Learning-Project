@@ -4,8 +4,65 @@
 # - Central configuration for dataset choice, model params, training, and XAI settings.
 #
 # Contributors:
-# - <Name 1>
+# - Anton Nemchinski
 # - <Name 2>
 # - <Name 3>
 
-# (Body of the YAML config goes here)
+# Random seed for reproducibility (same split, same initialization, etc.)
+seed: 42
+
+data:
+  # Which dataset loader to use inside src/data.py
+  # For now we only implement "kaggle_fake_news", later we can add "liar", etc.
+  dataset: "kaggle_fake_news"
+
+  # Maximum number of BPE tokens per example that we feed into DistilBERT.
+  # Longer texts are truncated; shorter ones are padded.
+  max_length: 256
+
+  # Fraction of the data reserved for validation (from the training portion).
+  val_size: 0.1
+
+  # Fraction of the full data reserved for the final test set.
+  test_size: 0.1
+
+model:
+  # Name of the Hugging Face model to use (passed to AutoTokenizer / AutoModel).
+  name: "distilbert-base-uncased"
+
+  # Number of output labels for classification (2 = fake vs real).
+  num_labels: 2
+
+train:
+  # Number of passes over the training set.
+  epochs: 2
+
+  # Per-device batch size during training. Increase when running full GPU runs.
+  batch_train: 16
+
+  # Per-device batch size during evaluation (usually can be larger than train).
+  batch_eval: 32
+
+  # Learning rate for the optimizer (AdamW inside Trainer).
+  lr: 2e-5
+
+  # L2 weight decay strength (regularization).
+  weight_decay: 0.01
+
+hardware:
+  # Preferred device: "cuda" tries to use the GPU, "cpu" forces CPU.
+  # Even if this is set to "cuda", the code will automatically fall back
+  # to CPU if no CUDA-capable GPU is available.
+  device: "cuda"
+
+  # When true, use a tiny subset of the data and fewer epochs for quick
+  # debugging on any machine (good for teammates without a GPU).
+  debug_mode: true
+
+xai:
+  # Number of samples from the test set to use when running explainability
+  # methods (LIME / SHAP / IG) so we don't blow up runtime.
+  sample_size: 50
+
+  # Lists of "top-k" important tokens used in deletion tests, etc.
+  topk_list: [3, 5, 10]

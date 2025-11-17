@@ -16,3 +16,19 @@ Key functions to implement:
 - explain_sample_lime(text: str, model, tokenizer, explainer, cfg) -> dict
 - run_lime_batch(dataset, model, tokenizer, cfg) -> list[dict]
 """
+
+
+"""
+All explanation methods should output a list of dicts with fields:
+
+{
+  "sample_id": int or str,
+  "text": str,
+  "tokens": [str, ...],
+  "importances": [float, ...],  # same length as tokens
+  "pred_label": int,
+  "true_label": int
+}
+
+These will be saved as JSON lines in artifacts/explanations/<method>_<run-id>.jsonl
+"""
