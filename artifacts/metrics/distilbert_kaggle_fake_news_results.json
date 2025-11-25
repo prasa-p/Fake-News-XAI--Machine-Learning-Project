@@ -1,0 +1,17 @@
+{
+  "dataset": "kaggle_fake_news",
+  "model": "distilbert-base-uncased",
+  "test_accuracy": 0.9992315573770492,
+  "test_f1": 0.9992917847025495,
+  "test_precision": 0.9990559358036346,
+  "test_recall": 0.9995277449822905,
+  "test_loss": 0.003635258413851261,
+  "hyperparameters": {
+    "learning_rate": 2e-05,
+    "batch_size": 16,
+    "epochs": 3,
+    "max_length": 512,
+    "weight_decay": 0.01,
+    "warmup_steps": 500
+  }
+}
