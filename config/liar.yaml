@@ -1,0 +1,40 @@
+# File: config/liar.yaml
+#
+# Training configuration for LIAR Dataset
+# Person 2 (Zaid) - DistilBERT Training & Tuning
+
+seed: 42
+
+hardware:
+  device: "cuda"  # "cuda" or "cpu"
+  debug_mode: false
+
+data:
+  dataset: "liar"
+  test_size: 0.2
+  val_size: 0.1
+
+model:
+  name: "distilbert-base-uncased"
+  num_labels: 2
+  max_length: 128  # LIAR statements are short (~15 words)
+
+train:
+  # Hyperparameters to tune
+  learning_rate: 0.00003     # 3e-5 - LIAR might need higher LR due to smaller dataset
+  num_epochs: 5           # More epochs for smaller dataset
+  batch_train: 32         # Can use larger batch for shorter texts
+  batch_eval: 64
+  
+  # Advanced settings
+  weight_decay: 0.01
+  warmup_steps: 200
+  save_steps: 200
+  eval_steps: 200
+  logging_steps: 50
+  
+  # Output
+  output_dir: "artifacts/distilbert/liar"
+  save_total_limit: 3
+  load_best_model_at_end: true
+  metric_for_best_model: "f1"

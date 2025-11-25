@@ -9,6 +9,7 @@ data/*
 !data/.gitkeep
 artifacts/*
 !artifacts/.gitkeep
+!artifacts/metrics
 
 # notebooks
 .ipynb_checkpoints/
@@ -19,3 +20,4 @@ huggingface/
 
 # Other
 requirements_local.txt
+PERSON2_QUICKSTART.md

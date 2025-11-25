@@ -1,0 +1,40 @@
+# File: config/kaggle.yaml
+#
+# Training configuration for Kaggle Fake News Dataset
+# Person 2 (Zaid) - DistilBERT Training & Tuning
+
+seed: 42
+
+hardware:
+  device: "cuda"  # "cuda" or "cpu"
+  debug_mode: false
+
+data:
+  dataset: "kaggle_fake_news"
+  test_size: 0.2
+  val_size: 0.1
+
+model:
+  name: "distilbert-base-uncased"
+  num_labels: 2
+  max_length: 512  # Kaggle articles are long (~400 words)
+
+train:
+  # Hyperparameters to tune
+  learning_rate: 0.00002     # 2e-5 - Try: 1e-5, 2e-5, 3e-5, 5e-5
+  num_epochs: 3           # Try: 3, 4, 5
+  batch_train: 16         # Try: 8, 16, 32 (depending on GPU memory)
+  batch_eval: 32
+  
+  # Advanced settings
+  weight_decay: 0.01
+  warmup_steps: 500
+  save_steps: 500
+  eval_steps: 500
+  logging_steps: 100
+  
+  # Output
+  output_dir: "artifacts/distilbert/kaggle"
+  save_total_limit: 3     # Keep only 3 best checkpoints
+  load_best_model_at_end: true
+  metric_for_best_model: "f1"

@@ -26,6 +26,50 @@ from sklearn.model_selection import train_test_split
 
 
 # ============================================================================
+# LOAD FROM PROCESSED CSVs (For Training - Person 2)
+# ============================================================================
+
+def load_processed_dataset(dataset_name='kaggle'):
+    """
+    Load already-processed train/val/test splits from CSV files.
+    This is faster than reprocessing from raw data.
+    
+    Args:
+        dataset_name (str): 'kaggle' or 'liar'
+        
+    Returns:
+        DatasetDict: HuggingFace DatasetDict with train/validation/test splits
+    """
+    processed_dir = Path("data/processed")
+    
+    # Load the three splits
+    train_df = pd.read_csv(processed_dir / f"{dataset_name}_train.csv")
+    val_df = pd.read_csv(processed_dir / f"{dataset_name}_val.csv")
+    test_df = pd.read_csv(processed_dir / f"{dataset_name}_test.csv")
+    
+    print(f"Loaded {dataset_name} dataset from processed CSVs:")
+    print(f"  Train: {len(train_df)} samples")
+    print(f"  Val:   {len(val_df)} samples")
+    print(f"  Test:  {len(test_df)} samples")
+    
+    # Convert to HuggingFace Datasets
+    train_ds = Dataset.from_pandas(train_df[['text', 'label']], preserve_index=False)
+    val_ds = Dataset.from_pandas(val_df[['text', 'label']], preserve_index=False)
+    test_ds = Dataset.from_pandas(test_df[['text', 'label']], preserve_index=False)
+    
+    # Encode labels as ClassLabel
+    train_ds = train_ds.class_encode_column("label")
+    val_ds = val_ds.class_encode_column("label")
+    test_ds = test_ds.class_encode_column("label")
+    
+    return DatasetDict({
+        "train": train_ds,
+        "validation": val_ds,
+        "test": test_ds,
+    })
+
+
+# ============================================================================
 # TEXT CLEANING UTILITIES (Person 1 - Prasa)
 # ============================================================================
 
