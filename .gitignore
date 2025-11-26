@@ -12,6 +12,8 @@ artifacts/*
 !artifacts/metrics
 
 !artifacts/explanations
+!artifacts/layers
+!artifacts/metrics
 
 # notebooks
 .ipynb_checkpoints/
