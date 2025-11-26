@@ -11,6 +11,8 @@ artifacts/*
 !artifacts/.gitkeep
 
 !artifacts/explanations
+!artifacts/layers
+!artifacts/metrics
 
 # notebooks
 .ipynb_checkpoints/
