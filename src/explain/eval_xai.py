@@ -1,227 +1,657 @@
+#!/usr/bin/env python
 """
-File: explain/eval_xai.py
+File: src/explain/eval_xai.py
 
-Responsibilities:
-- Evaluate explanation quality across methods (LIME, SHAP, IG).
-- Implement faithfulness (deletion/insertion tests), stability, and plausibility scoring.
-- Aggregate metrics into tables/CSVs for comparison across explainer types.
+Evaluate explanation methods (IG, LIME, SHAP) along three axes:
 
-Contributors:
-- <Name 1> Vidya Puliadi
-- <Name 2>
-- <Name 3>
+- Faithfulness: how much the model's confidence drops when we delete
+  the top-k most important tokens from the input (per method).
+- Stability: how consistent top-k tokens remain under small input
+  perturbations, using *_perturbed.jsonl files.
+- Plausibility: placeholder only (human ratings not yet available).
 
-Key functions to implement:
-- compute_faithfulness(explanations, model, tokenizer, cfg) -> dict
-- compute_stability(explanations_original, explanations_perturbed, cfg) -> dict
-- compute_plausibility(explanations, human_labels) -> dict
-- summarize_xai_metrics(all_metrics: dict, out_path: str) -> None
+Expected explanation file schema (one JSON per line):
+
+{
+  "sample_id": int,
+  "text": str,
+  "tokens": [str, ...],
+  "importances": [float, ...],
+  "pred_label": int,
+  "true_label": int,
+  "dataset": "kaggle" | "liar",
+  "method": "ig" | "lime" | "shap",
+  // optionally:
+  "prob_pred": float
+}
+
+Perturbed files are expected at:
+  artifacts/explanations/{dataset}_{method}_perturbed.jsonl
+
+Metrics are saved to:
+  artifacts/metrics/xai_metrics.json
+
+Usage:
+  PYTHONPATH=. python src/explain/eval_xai.py \
+      --datasets kaggle liar \
+      --methods ig lime shap \
+      --top-k 10 \
+      --max-samples 100
 """
 
-# src/explain/eval_xai.py
-#
-# Super simple evaluation code for LIME / SHAP / IG.
-# The goal is just to get basic numbers for:
-#   - faithfulness
-#   - stability
-#   - plausibility
-
+import argparse
 import json
-import math
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict, List, Tuple, Optional
 
+import numpy as np
 import torch
-import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
-def load_jsonl(path: str) -> List[Dict[str, Any]]:
-    items = []
-    with open(path, "r", encoding="utf-8") as f:
+# ---------------------------------------------------------------------------
+# Paths / config
+# ---------------------------------------------------------------------------
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+ARTIFACTS_DIR = ROOT_DIR / "artifacts"
+EXPL_DIR = ARTIFACTS_DIR / "explanations"
+METRICS_DIR = ARTIFACTS_DIR / "metrics"
+DISTILBERT_DIR = ARTIFACTS_DIR / "distilbert"
+
+DEFAULT_TOP_K = 10
+DEFAULT_MAX_SAMPLES = 100
+DEFAULT_MAX_LEN = 256
+
+
+# ---------------------------------------------------------------------------
+# Model loading & prediction helpers
+# ---------------------------------------------------------------------------
+
+def load_model_and_tokenizer(dataset: str, device: Optional[str] = None):
+    """
+    Load the fine-tuned DistilBERT model and tokenizer for a given dataset.
+
+    Expects checkpoint at:
+      artifacts/distilbert/{dataset}/final_model
+    """
+    ckpt_dir = DISTILBERT_DIR / dataset / "final_model"
+    if not ckpt_dir.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_dir}")
+
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+    model = AutoModelForSequenceClassification.from_pretrained(ckpt_dir)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
+
+    id2label = model.config.id2label
+    label2id = model.config.label2id
+
+    return model, tokenizer, device, id2label, label2id
+
+
+def predict_prob_for_label(
+    text: str,
+    model,
+    tokenizer,
+    device: str,
+    max_length: int,
+    label_id: int,
+) -> float:
+    """Return P(y = label_id | text) under the model."""
+    enc = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length",
+        max_length=max_length,
+    )
+    enc = {k: v.to(device) for k, v in enc.items()}
+    with torch.no_grad():
+        logits = model(**enc).logits  # (1, num_labels)
+        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+    return float(probs[label_id])
+
+
+# ---------------------------------------------------------------------------
+# Explanation IO helpers
+# ---------------------------------------------------------------------------
+
+def read_jsonl(path: Path, max_samples: Optional[int] = None) -> List[Dict]:
+    """Read a JSONL file into a list of dicts."""
+    records: List[Dict] = []
+    if not path.exists():
+        raise FileNotFoundError(f"Explanation file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            items.append(json.loads(line))
-    return items
+            records.append(json.loads(line))
+            if max_samples is not None and len(records) >= max_samples:
+                break
+    return records
 
 
-def top_k_indices(scores, k):
-    if not scores:
-        return []
-    k = min(k, len(scores))
-    return sorted(range(len(scores)), key=lambda i: abs(scores[i]), reverse=True)[:k]
+def safe_get_pred_label(rec: Dict) -> Optional[int]:
+    """Best-effort extraction of the predicted label id from explanation record."""
+    if "pred_label" in rec:
+        return int(rec["pred_label"])
+    if "predicted_label" in rec:
+        return int(rec["predicted_label"])
+    return None
 
 
-def cosine_similarity(a, b):
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+# ---------------------------------------------------------------------------
+# Faithfulness (deletion test)
+# ---------------------------------------------------------------------------
+
+SPECIAL_TOKENS = {"[CLS]", "[SEP]", "[PAD]"}
 
 
-def remove_tokens(tokens, bad_idx):
-    return " ".join(t for i, t in enumerate(tokens) if i not in bad_idx)
+def _top_indices(importances: np.ndarray, mask: np.ndarray, k: int) -> np.ndarray:
+    """Return indices of the top-k |importance| values, restricted by mask."""
+    if mask.sum() == 0:
+        return np.array([], dtype=int)
+
+    masked_scores = np.abs(importances.copy())
+    masked_scores[~mask] = -np.inf
+    k = min(k, int(mask.sum()))
+    if k <= 0:
+        return np.array([], dtype=int)
+
+    top_idx = np.argpartition(-masked_scores, k - 1)[:k]
+    # sort by magnitude descending
+    top_idx = top_idx[np.argsort(-masked_scores[top_idx])]
+    return top_idx
 
 
-def predict_proba(text: str, model, tokenizer, device, label_idx: int = 1) -> float:
+def deletion_text_lime(
+    rec: Dict,
+    model,
+    tokenizer,
+    device: str,
+    max_length: int,
+    top_k: int,
+) -> Optional[float]:
+    """
+    Faithfulness for LIME-style explanations.
+
+    Strategy: remove (string-replace) the top-k tokens from the original
+    text and measure the drop in model confidence for the original
+    predicted class.
+    """
+    text = rec["text"]
+    tokens = rec["tokens"]
+    importances = np.asarray(rec["importances"], dtype=float)
+
+    label_id = safe_get_pred_label(rec)
+    if label_id is None:
+        # fallback: recompute prediction & use argmax
+        enc = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            logits = model(**enc).logits
+            probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+        label_id = int(np.argmax(probs))
+
+    # mask out empty tokens
+    tokens_arr = np.array(tokens, dtype=object)
+    valid_mask = np.array(
+        [bool(t.strip()) for t in tokens_arr],
+        dtype=bool,
+    )
+    if valid_mask.sum() == 0:
+        return None
+
+    top_idx = _top_indices(importances, valid_mask, top_k)
+    if top_idx.size == 0:
+        return None
+
+    # Original probability
+    p_orig = predict_prob_for_label(text, model, tokenizer, device, max_length, label_id)
+
+    # Remove top-k tokens by naive string replacement
+    pert_text = text
+    for idx in top_idx:
+        tok = str(tokens_arr[idx])
+        if not tok.strip():
+            continue
+        # simple, over-aggressive replacement is OK for this approximate metric
+        pert_text = pert_text.replace(tok, " ")
+
+    p_pert = predict_prob_for_label(pert_text, model, tokenizer, device, max_length, label_id)
+    return p_orig - p_pert
+
+
+def deletion_tokens_bert(
+    rec: Dict,
+    model,
+    tokenizer,
+    device: str,
+    max_length: int,
+    top_k: int,
+) -> Optional[float]:
+    """
+    Faithfulness for IG / SHAP explanations with BERT-style tokens.
+
+    Strategy: mask the top-k token *positions* in the input_ids (using
+    [MASK] if available) and measure probability drop.
+    """
+    text = rec["text"]
+    tokens = rec["tokens"]
+    importances = np.asarray(rec["importances"], dtype=float)
+
+    label_id = safe_get_pred_label(rec)
+    if label_id is None:
+        enc = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            padding="max_length",
+            max_length=max_length,
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        with torch.no_grad():
+            logits = model(**enc).logits
+            probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+        label_id = int(np.argmax(probs))
+
+    # Encode text exactly as during training
     enc = tokenizer(
         text,
-        truncation=True,
-        padding=True,
         return_tensors="pt",
-    ).to(device)
+        truncation=True,
+        padding="max_length",
+        max_length=max_length,
+    )
+    input_ids = enc["input_ids"][0]  # (L,)
+    if len(tokens) != int(input_ids.shape[0]):
+        # Tokenization mismatch; skip this record
+        return None
+
+    # build mask of positions that are eligible for deletion
+    bert_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+    valid_mask = np.array(
+        [t not in SPECIAL_TOKENS for t in bert_tokens],
+        dtype=bool,
+    )
+    if valid_mask.sum() == 0:
+        return None
+
+    top_idx = _top_indices(importances, valid_mask, top_k)
+    if top_idx.size == 0:
+        return None
+
+    # Original probability
+    p_orig = predict_prob_for_label(text, model, tokenizer, device, max_length, label_id)
+
+    # Mask top-k positions
+    mask_id = tokenizer.mask_token_id
+    if mask_id is None:
+        # fall back to [UNK] if [MASK] missing
+        mask_id = tokenizer.unk_token_id
+
+    pert_input_ids = input_ids.clone()
+    for idx in top_idx:
+        pert_input_ids[idx] = mask_id
+
+    pert_enc = {
+        "input_ids": pert_input_ids.unsqueeze(0).to(device),
+        "attention_mask": enc["attention_mask"].to(device),
+    }
+
     with torch.no_grad():
-        out = model(**enc)
-        logits = out.logits  # shape (1, num_labels)
-        probs = F.softmax(logits, dim=-1)[0]
-    return probs[label_idx].item()
+        logits = model(**pert_enc).logits
+        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+    p_pert = float(probs[label_id])
+
+    return p_orig - p_pert
 
 
-def compute_faithfulness(explanations, model, tokenizer, cfg=None) -> dict:
-    top_k = 3 if cfg is None else cfg.get("top_k", 3)
-    max_examples = 200 if cfg is None else cfg.get("max_examples", 200)
-    label_idx = 1 if cfg is None else cfg.get("label_idx", 1)
+def evaluate_faithfulness_for_file(
+    dataset: str,
+    method: str,
+    model,
+    tokenizer,
+    device: str,
+    top_k: int,
+    max_samples: int,
+    max_length: int,
+) -> Optional[Dict]:
+    """Compute average deletion drop for a dataset/method."""
+    path = EXPL_DIR / f"{dataset}_{method}.jsonl"
+    if not path.exists():
+        print(f"[faithfulness] {path} not found, skipping.")
+        return None
 
-    device = next(model.parameters()).device
-    drops = []
+    records = read_jsonl(path, max_samples=max_samples)
 
-    for ex in explanations[:max_examples]:
-        text = ex["text"]
-        tokens = ex.get("tokens") or text.split()
-        imps = ex["importances"]  # list of floats
+    drops: List[float] = []
+    n_errors = 0
+    n_skipped_none = 0
+    n_skipped_nan = 0
 
-        p_orig = float(ex["prob_pred"]) if "prob_pred" in ex else \
-            predict_proba(text, model, tokenizer, device, label_idx)
+    for rec in records:
+        sample_id = rec.get("sample_id")
+        drop = None
 
-        bad_idx = top_k_indices(imps, top_k)
-        masked_text = remove_tokens(tokens, bad_idx)
-        p_masked = predict_proba(masked_text, model, tokenizer, device, label_idx)
+        try:
+            if method == "lime":
+                drop = deletion_text_lime(
+                    rec, model, tokenizer, device, max_length, top_k
+                )
+            else:  # ig / shap
+                drop = deletion_tokens_bert(
+                    rec, model, tokenizer, device, max_length, top_k
+                )
 
-        drops.append(p_orig - p_masked)
+        except Exception as e:
+            n_errors += 1
+            print(
+                f"[faithfulness] error on {dataset}/{method}, "
+                f"sample_id={sample_id}: {e}"
+            )
+            # For SHAP, show a bit more detail + stack trace
+            if method == "shap":
+                print(
+                    f"[DEBUG faithfulness shap] exception details for "
+                    f"{dataset}/{method}, sample_id={sample_id}"
+                )
+                print(f"  rec keys: {list(rec.keys())}")
+                print(f"  len(tokens)={len(rec.get('tokens', []))}, "
+                      f"len(importances)={len(rec.get('importances', []))}")
+                traceback.print_exc()
+            drop = None  # ensure we skip below
+
+        # Skip invalid drops; log why for SHAP
+        if drop is None:
+            n_skipped_none += 1
+            if method == "shap":
+                print(
+                    f"[DEBUG faithfulness shap] drop is None for {dataset}/{method}, "
+                    f"sample_id={sample_id}. "
+                    f"len(tokens)={len(rec.get('tokens', []))}, "
+                    f"len(importances)={len(rec.get('importances', []))}"
+                )
+            continue
+
+        # np.isnan on non-float raises, so be safe
+        try:
+            if np.isnan(drop):
+                n_skipped_nan += 1
+                if method == "shap":
+                    print(
+                        f"[DEBUG faithfulness shap] drop is NaN for {dataset}/{method}, "
+                        f"sample_id={sample_id}, drop={drop}"
+                    )
+                continue
+        except TypeError:
+            # If drop is not a scalar, this is also a bug – log it
+            n_skipped_nan += 1
+            if method == "shap":
+                print(
+                    f"[DEBUG faithfulness shap] drop has unexpected type "
+                    f"({type(drop)}) for {dataset}/{method}, "
+                    f"sample_id={sample_id}, value={drop}"
+                )
+            continue
+
+        drops.append(float(drop))
+
+    print(
+        f"[DEBUG faithfulness] Finished {dataset}/{method}, "
+        f"valid={len(drops)}, skipped_none={n_skipped_none}, "
+        f"skipped_nan={n_skipped_nan}, errors={n_errors}."
+    )
 
     if not drops:
-        return {"avg_drop": 0.0, "n": 0}
+        print(f"[faithfulness] No valid samples for {dataset}/{method}.")
+        return None
 
-    avg = sum(drops) / len(drops)
-    return {"avg_drop": avg, "n": len(drops)}
+    drops_arr = np.array(drops, dtype=float)
+    metrics = {
+        "dataset": dataset,
+        "method": method,
+        "n": int(len(drops_arr)),
+        "avg_drop": float(drops_arr.mean()),
+        "avg_abs_drop": float(np.abs(drops_arr).mean()),
+        "prop_positive_drop": float((drops_arr > 0).mean()),
+    }
+    print(f"[faithfulness] {dataset}_{method}: {metrics}")
+    return metrics
 
 
+# ---------------------------------------------------------------------------
+# Stability (top-k Jaccard using *_perturbed.jsonl)
+# ---------------------------------------------------------------------------
 
-def compute_stability(explanations_original, explanations_perturbed, cfg=None) -> dict:
-    max_pairs = 200 if cfg is None else cfg.get("max_pairs", 200)
+def top_token_set(rec: Dict, k: int) -> set:
+    """
+    Return a set of top-k token strings for a record, using |importance|.
 
-    orig_by_id = {ex["id"]: ex for ex in explanations_original if "id" in ex}
-    pert_by_id = {ex["id"]: ex for ex in explanations_perturbed if "id" in ex}
+    We normalize some BERT quirks (strip '##', lower-case) and ignore
+    obvious special tokens / empty strings.
+    """
+    tokens = rec["tokens"]
+    importances = np.asarray(rec["importances"], dtype=float)
 
-    sims = []
-    for ex_id, ex_orig in orig_by_id.items():
-        if ex_id not in pert_by_id:
+    pairs = []
+    for tok, imp in zip(tokens, importances):
+        t = str(tok).strip()
+        if not t:
             continue
-        ex_pert = pert_by_id[ex_id]
-
-        imp1 = ex_orig["importances"]
-        imp2 = ex_pert["importances"]
-        L = min(len(imp1), len(imp2))
-        if L == 0:
+        if t in SPECIAL_TOKENS:
             continue
-        sims.append(cosine_similarity(imp1[:L], imp2[:L]))
-        if len(sims) >= max_pairs:
-            break
+        # normalize subwords like "##ing" -> "ing"
+        if t.startswith("##"):
+            t = t[2:]
+        pairs.append((t.lower(), abs(float(imp))))
 
-    if not sims:
-        return {"avg_sim": 0.0, "n": 0}
+    if not pairs:
+        return set()
 
-    avg = sum(sims) / len(sims)
-    return {"avg_sim": avg, "n": len(sims)}
-
-
-def compute_plausibility(explanations, human_labels) -> dict:
-    sums = {}
-    counts = {}
-    for row in human_labels:
-        m = row["method"]
-        r = float(row["rating"])
-        sums[m] = sums.get(m, 0.0) + r
-        counts[m] = counts.get(m, 0) + 1
-
-    avg = {m: sums[m] / counts[m] for m in sums}
-    return avg
+    pairs.sort(key=lambda x: -x[1])
+    k = min(k, len(pairs))
+    top = [w for (w, _) in pairs[:k]]
+    return set(top)
 
 
-def summarize_xai_metrics(all_metrics: dict, out_path: str) -> None:
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
+def evaluate_stability_for_file(
+    dataset: str,
+    method: str,
+    top_k: int,
+    max_samples: int,
+) -> Optional[Dict]:
+    """
+    Stability metric: Jaccard similarity between top-k token sets for
+    original vs perturbed explanations.
+
+    Requires both:
+      artifacts/explanations/{dataset}_{method}.jsonl
+      artifacts/explanations/{dataset}_{method}_perturbed.jsonl
+    """
+    orig_path = EXPL_DIR / f"{dataset}_{method}.jsonl"
+    pert_path = EXPL_DIR / f"{dataset}_{method}_perturbed.jsonl"
+
+    if not orig_path.exists() or not pert_path.exists():
+        print(f"[stability] Skipping {dataset}_{method} (need {orig_path} AND {pert_path})")
+        return None
+
+    orig_records = read_jsonl(orig_path, max_samples=max_samples)
+    pert_records = read_jsonl(pert_path, max_samples=max_samples)
+
+    n = min(len(orig_records), len(pert_records))
+    if n == 0:
+        print(f"[stability] No paired samples for {dataset}/{method}.")
+        return None
+
+    jaccards: List[float] = []
+
+    for i in range(n):
+        r0 = orig_records[i]
+        r1 = pert_records[i]
+
+        # Optionally enforce same sample_id
+        if r0.get("sample_id") != r1.get("sample_id"):
+            # Still proceed, but warning once
+            pass
+
+        s0 = top_token_set(r0, top_k)
+        s1 = top_token_set(r1, top_k)
+
+        union = s0.union(s1)
+        if not union:
+            continue
+        inter = s0.intersection(s1)
+        j = len(inter) / len(union)
+        jaccards.append(j)
+
+    if not jaccards:
+        print(f"[stability] No valid overlaps for {dataset}/{method}.")
+        return None
+
+    j_arr = np.array(jaccards, dtype=float)
+    metrics = {
+        "dataset": dataset,
+        "method": method,
+        "n": int(len(j_arr)),
+        "avg_jaccard": float(j_arr.mean()),
+        "std_jaccard": float(j_arr.std()),
+    }
+    print(f"[stability] {dataset}_{method}: {metrics}")
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Plausibility (placeholder)
+# ---------------------------------------------------------------------------
+
+def evaluate_plausibility_placeholder():
+    """
+    Placeholder for plausibility metric based on human ratings.
+
+    Expected future schema for ratings file:
+      artifacts/metrics/human_ratings.jsonl, with fields like:
+        {
+          "sample_id": int,
+          "dataset": str,
+          "method": str,
+          "tokens": [...],
+          "importances": [...],
+          "human_score": float   # e.g. 1-5 scale
+        }
+
+    Currently, we just log that plausibility is skipped.
+    """
+    ratings_path = METRICS_DIR / "human_ratings.jsonl"
+    if not ratings_path.exists():
+        print("[plausibility] No human_ratings.jsonl found, skipping plausibility.")
+        return None
+
+    # If you do get ratings later, implement aggregation here.
+    print("[plausibility] human_ratings.jsonl found, but plausibility metric "
+          "is not yet implemented.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=["kaggle", "liar"],
+        help="Datasets to evaluate (e.g., kaggle liar)",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        default=["lime", "shap", "ig"],
+        help="Explanation methods to evaluate.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help="Top-k tokens to delete or compare.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=DEFAULT_MAX_SAMPLES,
+        help="Max samples per dataset/method to evaluate.",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=DEFAULT_MAX_LEN,
+        help="Max sequence length (should match training/explanation config).",
+    )
+    args = parser.parse_args()
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+
+    all_metrics = {
+        "faithfulness": {},
+        "stability": {},
+        "plausibility": None,
+    }
+
+    # Faithfulness & stability
+    for dataset in args.datasets:
+        # Load fine-tuned model for this dataset once
+        try:
+            model, tokenizer, device, id2label, label2id = load_model_and_tokenizer(dataset)
+        except Exception as e:
+            print(f"[eval_xai] Could not load model for dataset '{dataset}': {e}")
+            continue
+
+        for method in args.methods:
+            # Faithfulness
+            faith = evaluate_faithfulness_for_file(
+                dataset=dataset,
+                method=method,
+                model=model,
+                tokenizer=tokenizer,
+                device=device,
+                top_k=args.top_k,
+                max_samples=args.max_samples,
+                max_length=args.max_length,
+            )
+            if faith is not None:
+                all_metrics["faithfulness"].setdefault(dataset, {})[method] = faith
+
+            # Stability
+            stab = evaluate_stability_for_file(
+                dataset=dataset,
+                method=method,
+                top_k=args.top_k,
+                max_samples=args.max_samples,
+            )
+            if stab is not None:
+                all_metrics["stability"].setdefault(dataset, {})[method] = stab
+
+    # Plausibility (placeholder)
+    all_metrics["plausibility"] = evaluate_plausibility_placeholder()
+
+    out_path = METRICS_DIR / "xai_metrics.json"
+    with out_path.open("w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2)
     print(f"Saved XAI metrics to {out_path}")
 
 
 if __name__ == "__main__":
-
-    from src.models import get_tokenizer, get_distilbert_model  # adjust if needed
-
-    tokenizer = get_tokenizer()
-    model = get_distilbert_model()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()
-
-    datasets = ["kaggle", "liar"]
-    methods = ["lime", "shap", "ig"]
-
-    all_metrics = {}
-
-    # Faithfulness: basic deletion test
-    for ds in datasets:
-        for m in methods:
-            key = f"{ds}_{m}"
-            path = Path(f"artifacts/explanations/{key}.jsonl")
-            if not path.exists():
-                print(f"[faithfulness] Skipping {key} (no {path})")
-                continue
-
-            exs = load_jsonl(str(path))
-            faith = compute_faithfulness(
-                exs,
-                model,
-                tokenizer,
-                cfg={"top_k": 3, "max_examples": 100, "label_idx": 1},
-            )
-            all_metrics.setdefault(key, {})["faithfulness"] = faith
-            print(f"[faithfulness] {key}: {faith}")
-
-    # Stability: compare original vs. perturbed explanations if available
-    for ds in datasets:
-        for m in methods:
-            key = f"{ds}_{m}"
-            orig_path = Path(f"artifacts/explanations/{key}.jsonl")
-            pert_path = Path(f"artifacts/explanations/{key}_perturbed.jsonl")
-
-            if not (orig_path.exists() and pert_path.exists()):
-                print(f"[stability] Skipping {key} (need {orig_path} AND {pert_path})")
-                continue
-
-            ex_orig = load_jsonl(str(orig_path))
-            ex_pert = load_jsonl(str(pert_path))
-
-            stab = compute_stability(ex_orig, ex_pert, cfg={"max_pairs": 200})
-            all_metrics.setdefault(key, {})["stability"] = stab
-            print(f"[stability] {key}: {stab}")
-
-    # Plausibility: average human ratings per method
-    ratings_path = Path("artifacts/explanations/human_ratings.jsonl")
-    if ratings_path.exists():
-        human_labels = load_jsonl(str(ratings_path))
-        plaus = compute_plausibility([], human_labels)
-        all_metrics["plausibility"] = plaus
-        print(f"[plausibility] {plaus}")
-    else:
-        print("[plausibility] No human_ratings.jsonl found, skipping plausibility.")
-
-    summarize_xai_metrics(all_metrics, "artifacts/metrics/xai_metrics.json")
-
+    main()
