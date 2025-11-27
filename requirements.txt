@@ -13,6 +13,8 @@ scikit-learn==1.5.2
 pandas==2.2.2
 numpy==1.26.4
 matplotlib==3.9.2
+seaborn==0.12.3
+jupyterlab==4.2.4
 
 captum==0.7.0
 shap==0.45.0
