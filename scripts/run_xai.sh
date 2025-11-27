@@ -19,3 +19,6 @@ set -e
 PYTHONPATH=. python -m src.explain.run_xai_batch --dataset kaggle --methods ig lime shap
 PYTHONPATH=. python -m src.explain.run_xai_batch --dataset liar   --methods ig lime shap
 
+PYTHONPATH=. python -m src.explain.eval_xai
+
+
